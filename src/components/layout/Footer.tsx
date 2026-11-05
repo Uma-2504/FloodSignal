@@ -4,13 +4,6 @@ export default function Footer() {
   return (
     <footer className="border-t border-white/10 bg-slate-900/50 backdrop-blur-xl">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Disclaimer */}
-        <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl text-center">
-          <p className="text-amber-400 text-sm font-medium">
-            ⚠️ Demonstration Platform — This application contains sample data only. Not for real emergency use.
-          </p>
-        </div>
-
         <div className="flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             <Waves className="w-5 h-5 text-cyan-400" />
