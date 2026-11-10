@@ -22,6 +22,21 @@ export interface FloodReport {
   created_at: string;
 }
 
+export interface AIIncidentIntelligence {
+  incident_type: string;
+  severity: Severity;
+  road_access: string;
+  summary: string;
+  requires_attention: boolean;
+  confidence: number;
+  location_mentioned?: boolean;
+  landmark?: string | null;
+  area?: string | null;
+  district?: string | null;
+  state?: string | null;
+  affected_people_or_infrastructure?: string | null;
+}
+
 export interface Incident {
   id: string;
   reporterName: string;

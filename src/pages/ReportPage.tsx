@@ -22,6 +22,7 @@ import {
   Sparkles,
   RefreshCw,
   Layers,
+  Navigation,
 } from 'lucide-react';
 import type { Language, Severity } from '../types';
 import GlassCard from '../components/ui/GlassCard';
@@ -34,6 +35,9 @@ import {
   type DuplicateCheckResult,
 } from '../utils/duplicateDetector';
 import { sanitizeTextForAI } from '../utils/privacySanitizer';
+import { geocodeAddress, reverseGeocode, type GeocodeCandidate } from '../utils/geocoding';
+import LocationPickerMap from '../components/map/LocationPickerMap';
+import type { AIIncidentIntelligence } from '../types';
 
 /* ─── Constants ──────────────────────────────────────────────────────── */
 
@@ -148,6 +152,22 @@ export default function ReportPage() {
   /* ── step 3 state ── */
   const [selectedLocation, setSelectedLocation] = useState('');
   const [manualAddress, setManualAddress] = useState('');
+  const [manualCoords, setManualCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [manualGeocodedName, setManualGeocodedName] = useState<string | null>(null);
+  const [geocodeCandidates, setGeocodeCandidates] = useState<GeocodeCandidate[]>([]);
+  const [isGeocoding, setIsGeocoding] = useState(false);
+  const [geocodeError, setGeocodeError] = useState<string | null>(null);
+  const [locationMethod, setLocationMethod] = useState<'voice' | 'manual' | 'gps' | 'preset'>('gps');
+  const [isLocatingGPS, setIsLocatingGPS] = useState(false);
+  const [gpsError, setGpsError] = useState<string | null>(null);
+  const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
+  const [gpsPermissionStatus, setGpsPermissionStatus] = useState<'prompt' | 'granted' | 'denied' | 'unavailable' | 'done'>('prompt');
+
+  // Spoken incident landmark (separate from current GPS coordinates)
+  const [spokenLandmark, setSpokenLandmark] = useState<{
+    name: string;
+    coords?: { lat: number; lng: number } | null;
+  } | null>(null);
 
   /* ── step 5 ── */
   const [incidentId, setIncidentId] = useState(
@@ -207,7 +227,7 @@ export default function ReportPage() {
       }
 
       if (data && data.success && data.analysis) {
-        const analysis = data.analysis as AIAnalysis;
+        const analysis = data.analysis as AIIncidentIntelligence;
         setAiAnalysis(analysis);
         if (data.model) setAiModel(data.model);
 
@@ -224,6 +244,36 @@ export default function ReportPage() {
         }
         if (analysis.summary) {
           setReviewedSummary(analysis.summary);
+        }
+
+        // Landmark detection from citizen statement
+        if (analysis.location_mentioned && analysis.landmark) {
+          const landmarkQuery = analysis.landmark.trim();
+
+          // Geocode the spoken landmark
+          geocodeAddress(landmarkQuery)
+            .then((geoRes) => {
+              if (geoRes) {
+                setSpokenLandmark({
+                  name: landmarkQuery,
+                  coords: { lat: geoRes.latitude, lng: geoRes.longitude },
+                });
+                // If citizen does NOT have valid GPS or requested landmark fallback, pin it
+                if (!manualCoords || locationMethod !== 'gps') {
+                  setManualCoords({ lat: geoRes.latitude, lng: geoRes.longitude });
+                  setManualGeocodedName(geoRes.displayName);
+                  setManualAddress(landmarkQuery);
+                  setLocationMethod('voice');
+                  setSelectedLocation('');
+                }
+              } else {
+                setSpokenLandmark({ name: landmarkQuery, coords: null });
+              }
+            })
+            .catch((err) => {
+              console.warn('[Geocoding] Error resolving voice landmark:', err);
+              setSpokenLandmark({ name: landmarkQuery, coords: null });
+            });
         }
       } else {
         setAiAnalysisError('AI analysis returned an unexpected response format.');
@@ -518,6 +568,113 @@ export default function ReportPage() {
     return 'flood_general';
   }, [stranded, waterRising]);
 
+  /* ── request GPS location automatically on load (primary location source) ── */
+  const handleRequestGPS = useCallback(async () => {
+    if (!navigator.geolocation) {
+      setGpsPermissionStatus('unavailable');
+      setGpsError('Geolocation is not supported by your browser device.');
+      return;
+    }
+
+    setIsLocatingGPS(true);
+    setGpsError(null);
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        const accuracy = pos.coords.accuracy;
+
+        setGpsAccuracy(accuracy);
+        setGpsPermissionStatus('granted');
+        setManualCoords({ lat, lng });
+        setLocationMethod('gps');
+        setSelectedLocation('');
+        setGeocodeError(null);
+
+        try {
+          const revName = await reverseGeocode(lat, lng);
+          const formatted = revName || `GPS Position [${lat.toFixed(4)}, ${lng.toFixed(4)}]`;
+          setManualGeocodedName(formatted);
+          setManualAddress(formatted);
+        } catch {
+          const fallback = `GPS Position [${lat.toFixed(4)}, ${lng.toFixed(4)}]`;
+          setManualGeocodedName(fallback);
+          setManualAddress(fallback);
+        } finally {
+          setIsLocatingGPS(false);
+          setGpsPermissionStatus('done');
+        }
+      },
+      (err) => {
+        setIsLocatingGPS(false);
+        if (err.code === err.PERMISSION_DENIED) {
+          setGpsPermissionStatus('denied');
+          setGpsError('GPS permission was denied. You can state a landmark or select your area manually below.');
+        } else if (err.code === err.TIMEOUT) {
+          setGpsPermissionStatus('unavailable');
+          setGpsError('GPS location request timed out. Please enter a nearby landmark.');
+        } else {
+          setGpsPermissionStatus('unavailable');
+          setGpsError('Device location is currently unavailable. Please enter a landmark or choose an area.');
+        }
+      },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+    );
+  }, []);
+
+  /* ── automatically trigger GPS on component mount ── */
+  useEffect(() => {
+    handleRequestGPS();
+  }, [handleRequestGPS]);
+
+  /* ── geocode manual address with debounce ── */
+  useEffect(() => {
+    if (!manualAddress.trim()) {
+      setManualCoords(null);
+      setManualGeocodedName(null);
+      setGeocodeCandidates([]);
+      setGeocodeError(null);
+      setIsGeocoding(false);
+      return;
+    }
+
+    // Clear coords if text changes and show loading
+    const controller = new AbortController();
+    setIsGeocoding(true);
+    setGeocodeError(null);
+
+    const timer = setTimeout(async () => {
+      try {
+        const result = await geocodeAddress(manualAddress, controller.signal);
+        if (result) {
+          setManualCoords({ lat: result.latitude, lng: result.longitude });
+          setManualGeocodedName(result.displayName);
+          setGeocodeCandidates(result.candidates || []);
+          setGeocodeError(null);
+        } else {
+          setManualCoords(null);
+          setManualGeocodedName(null);
+          setGeocodeCandidates([]);
+          setGeocodeError('Could not locate this landmark. You can click on the map to pin it manually.');
+        }
+      } catch (err: unknown) {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        setManualCoords(null);
+        setManualGeocodedName(null);
+        setGeocodeCandidates([]);
+        setGeocodeError('Geocoding service unavailable. You can click on the map to pin it manually.');
+      } finally {
+        setIsGeocoding(false);
+      }
+    }, 750);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [manualAddress]);
+
   /* ── duplicate detection checker ── */
   const runDuplicateCheck = useCallback(async () => {
     const textToCheck = (inputMethod === 'voice' ? transcription : textInput).trim();
@@ -526,8 +683,8 @@ export default function ReportPage() {
     setCheckingDuplicates(true);
     try {
       const chosenPreset = LOCATIONS.find((l) => l.name === selectedLocation);
-      const latitude = chosenPreset?.lat ?? (manualAddress ? 13.0827 : null);
-      const longitude = chosenPreset?.lng ?? (manualAddress ? 80.2707 : null);
+      const latitude = chosenPreset?.lat ?? manualCoords?.lat ?? null;
+      const longitude = chosenPreset?.lng ?? manualCoords?.lng ?? null;
       const locationName = selectedLocation || manualAddress || null;
       const effectiveIncidentType =
         reviewedIncidentType || aiAnalysis?.incident_type || deriveIncidentType();
@@ -557,6 +714,7 @@ export default function ReportPage() {
     textInput,
     selectedLocation,
     manualAddress,
+    manualCoords,
     reviewedIncidentType,
     aiAnalysis,
     deriveIncidentType,
@@ -574,11 +732,17 @@ export default function ReportPage() {
     setSubmitting(true);
     setSubmitError(null);
 
-    // Resolve location coordinates
+    // Resolve location coordinates accurately
     const chosenPreset = LOCATIONS.find((l) => l.name === selectedLocation);
-    const latitude = chosenPreset?.lat ?? 13.0827;
-    const longitude = chosenPreset?.lng ?? 80.2707;
+    const latitude = chosenPreset?.lat ?? manualCoords?.lat;
+    const longitude = chosenPreset?.lng ?? manualCoords?.lng;
     const locationName = (selectedLocation || manualAddress || '').trim();
+
+    if (latitude === undefined || longitude === undefined || latitude === null || longitude === null) {
+      setSubmitError('Please select a valid location or enter an address with verified coordinates.');
+      setSubmitting(false);
+      return;
+    }
 
     const rawDescription = inputMethod === 'voice' ? transcription : textInput;
     const description = (rawDescription || '').trim();
@@ -670,6 +834,7 @@ export default function ReportPage() {
   }, [
     selectedLocation,
     manualAddress,
+    manualCoords,
     inputMethod,
     transcription,
     textInput,
@@ -698,6 +863,10 @@ export default function ReportPage() {
     setAdditionalDetails('');
     setSelectedLocation('');
     setManualAddress('');
+    setManualCoords(null);
+    setManualGeocodedName(null);
+    setIsGeocoding(false);
+    setGeocodeError(null);
     setSubmitting(false);
     setSubmitError(null);
     setAiAnalysis(null);
@@ -729,7 +898,11 @@ export default function ReportPage() {
       case 2:
         return stranded !== null && waterRising !== null;
       case 3:
-        return locationText.trim().length > 0;
+        if (selectedLocation) return true;
+        if (manualAddress.trim()) {
+          return !isGeocoding && manualCoords !== null;
+        }
+        return false;
       default:
         return true;
     }
@@ -744,7 +917,7 @@ export default function ReportPage() {
 
   /* ─── Progress Bar ─────────────────────────────────────────────────── */
 
-  const ProgressBar = () => (
+  const renderProgressBar = () => (
     <div className="mb-10">
       <div className="flex items-center justify-between mb-3">
         {STEP_LABELS.map((label, i) => {
@@ -788,12 +961,53 @@ export default function ReportPage() {
 
   /* ─── Step 1 ───────────────────────────────────────────────────────── */
 
-  const Step1 = () => (
+  const renderStep1 = () => (
     <div className="space-y-8 animate-fadeIn">
       {/* header */}
       <div className="text-center space-y-2">
         <h2 className="text-3xl font-bold text-white">Report a Flood Incident</h2>
         <p className="text-slate-400">Your report helps save lives. Speak or type in your preferred language.</p>
+      </div>
+
+      {/* Real-time GPS Detection Status Pill */}
+      <div className="p-3.5 rounded-2xl bg-cyan-950/30 border border-cyan-500/20 flex items-center justify-between gap-3 text-xs">
+        <div className="flex items-center gap-2.5">
+          <Navigation className={`w-4 h-4 shrink-0 ${isLocatingGPS ? 'text-cyan-400 animate-pulse' : manualCoords ? 'text-emerald-400' : 'text-slate-400'}`} />
+          <div>
+            <span className="font-semibold text-white">
+              {isLocatingGPS
+                ? 'Detecting current GPS location...'
+                : manualCoords && locationMethod === 'gps'
+                ? `GPS Active: ${manualGeocodedName || `[${manualCoords.lat.toFixed(4)}, ${manualCoords.lng.toFixed(4)}]`}`
+                : gpsPermissionStatus === 'denied'
+                ? 'GPS permission denied (landmark or area fallback will be used)'
+                : 'GPS position ready'}
+            </span>
+            {gpsAccuracy !== null && manualCoords && (
+              <span className="text-[11px] text-emerald-400/80 ml-2 font-mono">
+                (±{Math.round(gpsAccuracy)}m accuracy)
+              </span>
+            )}
+          </div>
+        </div>
+
+        {isLocatingGPS ? (
+          <span className="text-[11px] text-cyan-400 flex items-center gap-1">
+            <Loader2 className="w-3 h-3 animate-spin" /> Locating
+          </span>
+        ) : !manualCoords ? (
+          <button
+            type="button"
+            onClick={handleRequestGPS}
+            className="text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 underline underline-offset-2"
+          >
+            Enable GPS
+          </button>
+        ) : (
+          <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+            GPS Locked
+          </span>
+        )}
       </div>
 
       {/* language selection */}
@@ -1045,7 +1259,7 @@ export default function ReportPage() {
 
   /* ─── Step 2 ───────────────────────────────────────────────────────── */
 
-  const Step2 = () => (
+  const renderStep2 = () => (
     <div className="space-y-8 animate-fadeIn">
       <div className="text-center space-y-2">
         <h2 className="text-3xl font-bold text-white">Flood Details</h2>
@@ -1189,70 +1403,272 @@ export default function ReportPage() {
 
   /* ─── Step 3 ───────────────────────────────────────────────────────── */
 
-  const Step3 = () => (
+  const renderStep3 = () => (
     <div className="space-y-8 animate-fadeIn">
       <div className="text-center space-y-2">
-        <h2 className="text-3xl font-bold text-white">Select Your Location</h2>
-        <p className="text-slate-400">Choose the area where flooding is occurring.</p>
+        <h2 className="text-3xl font-bold text-white">Incident Location</h2>
+        <p className="text-slate-400">
+          Your current device GPS position is automatically detected. You can review or adjust the map pin below.
+        </p>
       </div>
 
-      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {LOCATIONS.map((loc) => (
-          <GlassCard
-            key={loc.name}
-            hover
-            padding="md"
-            className={`transition-all duration-300 ${
-              selectedLocation === loc.name
-                ? 'border-cyan-400/60 shadow-lg shadow-cyan-500/10 bg-cyan-500/10'
-                : ''
-            }`}
-            onClick={() => {
-              setSelectedLocation(loc.name);
-              setManualAddress('');
-            }}
-          >
-            <div className="flex items-start gap-3">
-              <MapPin
-                className={`w-5 h-5 mt-0.5 shrink-0 ${
-                  selectedLocation === loc.name ? 'text-cyan-400' : 'text-slate-500'
-                }`}
-              />
-              <div>
-                <p className="text-white font-semibold">{loc.name}</p>
-                <p className="text-slate-400 text-xs mt-1">{loc.description}</p>
-              </div>
-            </div>
-            {selectedLocation === loc.name && (
-              <CheckCircle className="w-5 h-5 text-cyan-400 mt-3" />
+      {/* GPS Status Banner */}
+      <div className="p-4 rounded-2xl bg-cyan-950/40 border border-cyan-500/30 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="p-2.5 rounded-xl bg-cyan-500/20 text-cyan-400 shrink-0">
+            {isLocatingGPS ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : locationMethod === 'gps' ? (
+              <Navigation className="w-5 h-5 text-emerald-400" />
+            ) : (
+              <MapPin className="w-5 h-5 text-cyan-400" />
             )}
-          </GlassCard>
-        ))}
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-white text-sm">
+                {isLocatingGPS
+                  ? 'Detecting device GPS coordinates...'
+                  : locationMethod === 'gps'
+                  ? 'Automatic GPS Location Active'
+                  : locationMethod === 'voice'
+                  ? 'Voice Detected Landmark Active'
+                  : 'Manual Pinned Location Active'}
+              </span>
+              {gpsAccuracy !== null && locationMethod === 'gps' && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                  ±{Math.round(gpsAccuracy)}m accuracy
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {manualGeocodedName || 'Acquiring location coordinates...'}
+            </p>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleRequestGPS}
+          disabled={isLocatingGPS}
+          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/30 transition-all disabled:opacity-50"
+        >
+          {isLocatingGPS ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="w-3.5 h-3.5" />
+          )}
+          <span>{isLocatingGPS ? 'Locating...' : 'Refresh GPS'}</span>
+        </button>
       </div>
 
-      {/* manual address */}
+      {/* Spoken Landmark vs GPS Notification */}
+      {spokenLandmark && (
+        <div className="p-4 rounded-2xl bg-slate-800/80 border border-cyan-400/30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+          <div>
+            <p className="text-cyan-300 font-semibold flex items-center gap-1.5">
+              <Sparkles className="w-4 h-4 text-cyan-400 shrink-0" />
+              Different Incident Landmark Mentioned in Speech:
+            </p>
+            <p className="text-slate-300 mt-1">
+              You mentioned <strong className="text-white">"{spokenLandmark.name}"</strong> in your voice report.
+              {locationMethod === 'gps' && (
+                <span className="text-slate-400 block mt-0.5">
+                  The map is currently pinned to your physical GPS position. Would you like to pin the spoken incident landmark instead?
+                </span>
+              )}
+            </p>
+          </div>
+
+          {spokenLandmark.coords && locationMethod !== 'voice' && (
+            <button
+              type="button"
+              onClick={() => {
+                if (spokenLandmark.coords) {
+                  setManualCoords(spokenLandmark.coords);
+                  setManualAddress(spokenLandmark.name);
+                  setManualGeocodedName(`Spoken Landmark: ${spokenLandmark.name}`);
+                  setLocationMethod('voice');
+                  setSelectedLocation('');
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 font-semibold shrink-0 transition-all"
+            >
+              <MapPin className="w-3.5 h-3.5 text-cyan-400" />
+              Pin "{spokenLandmark.name}"
+            </button>
+          )}
+
+          {locationMethod === 'voice' && (
+            <button
+              type="button"
+              onClick={handleRequestGPS}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-semibold shrink-0 transition-all"
+            >
+              <Navigation className="w-3.5 h-3.5 text-emerald-400" />
+              Revert to My Device GPS
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Leaflet Map Preview */}
+      {manualCoords && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between text-xs text-slate-400">
+            <span className="font-semibold text-white flex items-center gap-1.5">
+              <MapPin className="w-3.5 h-3.5 text-cyan-400" />
+              Pinned Incident Marker
+            </span>
+            <span className="text-[11px] text-slate-500">
+              Click anywhere on the map to adjust pin position if needed
+            </span>
+          </div>
+          <LocationPickerMap
+            latitude={manualCoords.lat}
+            longitude={manualCoords.lng}
+            locationName={manualGeocodedName || manualAddress || 'Incident Location'}
+            zoom={15}
+            height="260px"
+            onLocationSelect={async (lat, lng) => {
+              setManualCoords({ lat, lng });
+              setLocationMethod('manual');
+              setSelectedLocation('');
+              setGeocodeError(null);
+              try {
+                const rev = await reverseGeocode(lat, lng);
+                setManualGeocodedName(rev || `Adjusted Pin [${lat.toFixed(4)}, ${lng.toFixed(4)}]`);
+                setManualAddress(rev || `[${lat.toFixed(4)}, ${lng.toFixed(4)}]`);
+              } catch {
+                setManualGeocodedName(`Adjusted Pin [${lat.toFixed(4)}, ${lng.toFixed(4)}]`);
+              }
+            }}
+          />
+        </div>
+      )}
+
+      {/* Fallback Section (Manual Landmark or Popular Area) */}
       <GlassCard padding="lg">
-        <div className="flex justify-between items-center mb-3">
-          <h3 className="text-white font-semibold">Or enter address manually</h3>
+        <div className="flex flex-wrap justify-between items-center gap-2 mb-3">
+          <h3 className="text-white font-semibold flex items-center gap-2">
+            <span>Manual Landmark / Area Fallback</span>
+            {isGeocoding && <Loader2 className="w-4 h-4 text-cyan-400 animate-spin" />}
+          </h3>
           <span className="text-[11px] text-slate-500 font-mono">
             {manualAddress.length} / 250
           </span>
         </div>
-        <input
-          type="text"
-          value={manualAddress}
-          maxLength={250}
-          onChange={(e) => {
-            setManualAddress(e.target.value);
-            setSelectedLocation('');
-          }}
-          placeholder="Enter full address or landmark (max 250 characters)..."
-          className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-cyan-400/50 focus:ring-1 focus:ring-cyan-400/20 transition-all text-sm"
-        />
-        <p className="text-xs text-slate-600 mt-3 flex items-center gap-1.5">
-          <MapPin className="w-3.5 h-3.5" />
-          Coordinates will default to Chennai central area for manual addresses
-        </p>
+
+        {gpsError && (
+          <div className="mb-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300 flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-amber-200">{gpsError}</p>
+              <p className="text-[11px] text-amber-300/80 mt-0.5">
+                Don't worry — you can enter your nearby landmark, street, or select an area below.
+              </p>
+            </div>
+          </div>
+        )}
+
+        <div className="relative">
+          <input
+            type="text"
+            value={manualAddress}
+            maxLength={250}
+            onChange={(e) => {
+              setManualAddress(e.target.value);
+              setSelectedLocation('');
+              setLocationMethod('manual');
+            }}
+            placeholder="Search landmark or address (e.g. Chengalpattu Railway Station, Tambaram)..."
+            className={`w-full bg-white/5 border rounded-xl px-4 py-3 text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 transition-all text-sm ${
+              manualCoords
+                ? 'border-emerald-500/50 focus:border-emerald-400 focus:ring-emerald-400/20'
+                : geocodeError
+                ? 'border-amber-500/50 focus:border-amber-400 focus:ring-amber-400/20'
+                : 'border-white/10 focus:border-cyan-400/50 focus:ring-cyan-400/20'
+            }`}
+          />
+          {isGeocoding && (
+            <div className="absolute right-3 top-3 text-cyan-400">
+              <Loader2 className="w-5 h-5 animate-spin" />
+            </div>
+          )}
+        </div>
+
+        {/* Candidate disambiguation if multiple potential landmark matches */}
+        {!isGeocoding && geocodeCandidates.length > 1 && (
+          <div className="mt-3 p-3 rounded-xl bg-slate-800/80 border border-cyan-500/20 space-y-2">
+            <p className="text-xs text-cyan-400 font-medium flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5" />
+              Matching Landmarks (select if different from above):
+            </p>
+            <div className="space-y-1.5">
+              {geocodeCandidates.map((candidate, idx) => {
+                const isSelected =
+                  manualCoords &&
+                  Math.abs(manualCoords.lat - candidate.latitude) < 0.0001 &&
+                  Math.abs(manualCoords.lng - candidate.longitude) < 0.0001;
+
+                return (
+                  <button
+                    key={`${candidate.latitude}-${candidate.longitude}-${idx}`}
+                    type="button"
+                    onClick={() => {
+                      setManualCoords({ lat: candidate.latitude, lng: candidate.longitude });
+                      setManualGeocodedName(candidate.displayName);
+                      setLocationMethod('manual');
+                    }}
+                    className={`w-full text-left p-2 rounded-lg text-xs transition-all flex items-start justify-between gap-2 ${
+                      isSelected
+                        ? 'bg-cyan-500/20 border border-cyan-500/50 text-white'
+                        : 'bg-white/5 border border-white/5 text-slate-300 hover:bg-cyan-500/10 hover:border-cyan-500/30'
+                    }`}
+                  >
+                    <div className="truncate">
+                      <div className="font-semibold text-white truncate">{candidate.name}</div>
+                      <div className="text-[10px] text-slate-400 truncate">{candidate.displayName}</div>
+                    </div>
+                    {isSelected && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/30 text-cyan-300 font-medium shrink-0">
+                        Active
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="mt-5 pt-4 border-t border-white/5">
+          <p className="text-xs text-slate-400 font-medium mb-3">Or choose a predefined area:</p>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            {LOCATIONS.map((loc) => (
+              <button
+                key={loc.name}
+                type="button"
+                onClick={() => {
+                  setSelectedLocation(loc.name);
+                  setManualCoords({ lat: loc.lat, lng: loc.lng });
+                  setManualAddress(loc.name);
+                  setManualGeocodedName(loc.description);
+                  setLocationMethod('preset');
+                  setGeocodeError(null);
+                }}
+                className={`p-2.5 rounded-xl border text-left transition-all ${
+                  selectedLocation === loc.name
+                    ? 'bg-cyan-500/20 border-cyan-400/60 text-white shadow-lg shadow-cyan-500/10'
+                    : 'bg-white/5 border-white/5 text-slate-300 hover:bg-white/10'
+                }`}
+              >
+                <div className="font-semibold text-xs text-white truncate">{loc.name}</div>
+                <div className="text-[10px] text-slate-400 truncate">{loc.description}</div>
+              </button>
+            ))}
+          </div>
+        </div>
       </GlassCard>
     </div>
   );
@@ -1282,7 +1698,7 @@ export default function ReportPage() {
     </div>
   );
 
-  const Step4 = () => (
+  const renderStep4 = () => (
     <div className="space-y-8 animate-fadeIn">
       <div className="text-center space-y-2">
         <h2 className="text-3xl font-bold text-white">Review Your Report</h2>
@@ -1605,9 +2021,21 @@ export default function ReportPage() {
         <SummaryRow
           label="Location"
           value={
-            <span className="flex items-center gap-1.5">
-              <MapPin className="w-3.5 h-3.5 text-cyan-400 shrink-0" /> {locationText}
-            </span>
+            <div className="space-y-0.5">
+              <span className="flex items-center gap-1.5">
+                <MapPin className="w-3.5 h-3.5 text-cyan-400 shrink-0" /> {locationText}
+              </span>
+              {manualCoords && (
+                <div className="flex items-center gap-2 pl-5 pt-0.5">
+                  <span className="text-[11px] text-emerald-400">
+                    Coordinates: [{manualCoords.lat.toFixed(4)}, {manualCoords.lng.toFixed(4)}]
+                  </span>
+                  <span className="text-[10px] uppercase font-mono px-1.5 py-0.2 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
+                    Source: {locationMethod}
+                  </span>
+                </div>
+              )}
+            </div>
           }
           editStep={3}
         />
@@ -1633,7 +2061,7 @@ export default function ReportPage() {
 
   /* ─── Step 5 ───────────────────────────────────────────────────────── */
 
-  const Step5 = () => (
+  const renderStep5 = () => (
     <div className="space-y-8 animate-fadeIn text-center">
       {/* success animation */}
       <div className="flex justify-center">
@@ -1689,13 +2117,13 @@ export default function ReportPage() {
 
   return (
     <div className="min-h-screen px-4 py-10 sm:px-6 lg:px-8 max-w-5xl mx-auto">
-      <ProgressBar />
+      {renderProgressBar()}
 
-      {step === 1 && <Step1 />}
-      {step === 2 && <Step2 />}
-      {step === 3 && <Step3 />}
-      {step === 4 && <Step4 />}
-      {step === 5 && <Step5 />}
+      {step === 1 && renderStep1()}
+      {step === 2 && renderStep2()}
+      {step === 3 && renderStep3()}
+      {step === 4 && renderStep4()}
+      {step === 5 && renderStep5()}
 
       {/* navigation */}
       {step < 5 && (
